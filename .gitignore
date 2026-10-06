@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.env
+.env.*
+*.blend
+*.blend[0-9]*
+*.blend@
+blender_interior/
+blender_interior_skill_tests/
+skill-backups/
+test-output/
+local-references/

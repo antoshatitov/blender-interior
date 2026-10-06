@@ -1,0 +1,11 @@
+interface:
+  display_name: "blender-interior"
+  short_description: "Интерьер по референсам и проверка модели через MCP"
+  default_prompt: "Используй $blender-interior: примени дизайн из указанной папки к выбранным помещениям и проверь весь дом через MCP Blender."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "blender"
+      description: "MCP Blender: выполнение Python и осмотр viewport"
+policy:
+  allow_implicit_invocation: true
