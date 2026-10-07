@@ -53,8 +53,39 @@ def run(output_directory):
     curve_obj = bpy.data.objects.new("protected_curve", curve)
     s.collection.objects.link(curve_obj)
     bpy.context.view_layer.update()
+    raw_curve_keys = set(curve.keys())
     baseline = qa.snapshot([solid.name, curve_obj.name])
+    verify("snapshot_does_not_create_curve_settings", set(curve.keys()) == raw_curve_keys)
     verify("unchanged_snapshot", qa.compare_snapshot(baseline)["ok"])
+    verify("repeated_snapshot_is_stable", qa.snapshot([solid.name, curve_obj.name]) == baseline)
+
+    def lazy_extension_get(data):
+        data["review_getter_side_effect"] = True
+        return 1.0
+
+    bpy.types.Curve.review_lazy_extension = bpy.props.FloatProperty(get=lazy_extension_get)
+    try:
+        raw_curve_keys = set(curve.keys())
+        qa.snapshot([curve_obj.name])
+        verify("snapshot_skips_lazy_extension_getters", set(curve.keys()) == raw_curve_keys)
+    finally:
+        del bpy.types.Curve.review_lazy_extension
+
+    principal = mat.node_tree.nodes.get("Principled BSDF")
+    for node_type, input_name, changed_value in (
+        ("ShaderNodeValue", "Roughness", .123),
+        ("ShaderNodeRGB", "Base Color", (.1, .2, .3, 1)),
+    ):
+        node = mat.node_tree.nodes.new(node_type)
+        mat.node_tree.links.new(node.outputs[0], principal.inputs[input_name])
+        original = node.outputs[0].default_value
+        original = tuple(original) if node_type == "ShaderNodeRGB" else original
+        material_before = qa.snapshot([solid.name])
+        node.outputs[0].default_value = changed_value
+        verify(node_type + "_output_change_detected", not qa.compare_snapshot(material_before)["ok"])
+        node.outputs[0].default_value = original
+        mat.node_tree.nodes.remove(node)
+    baseline = qa.snapshot([solid.name, curve_obj.name])
     mat.node_tree.nodes.get("Principled BSDF").inputs["Roughness"].default_value = .123
     verify("shared_material_change_detected", not qa.compare_snapshot(baseline)["ok"])
     mat.node_tree.nodes.get("Principled BSDF").inputs["Roughness"].default_value = .5
@@ -101,7 +132,40 @@ def run(output_directory):
     verify("coplanar_overlap_detected", qa.inspect_pair(plane, duplicate)["coplanar_overlap_triangle_pairs"] > 0)
     verify("shared_edge_is_not_coplanar_overlap", qa.inspect_pair(plane, adjacent)["coplanar_overlap_triangle_pairs"] == 0)
     verify("crossing_surfaces_detected", qa.inspect_pair(plane, vertical)["crossing_surface_candidates"] > 0)
+    seam = mesh("crossing_at_mesh_seam", [(.5,.1,-.5),(.5,.9,-.5),(.5,.1,0),
+                                         (.5,.9,0),(.5,.1,.5),(.5,.9,.5)],
+                [(0,1,3,2),(2,3,5,4)])
+    bpy.context.view_layer.update()
+    seam_result = qa.inspect_pair(plane, seam)
+    verify("seam_crossing_requires_further_check", not seam_result["truncated"] and
+           seam_result["ambiguous_contact_triangle_pairs"] > 0)
     verify("pair_budget_explicit", qa.pair_candidates(max_pairs=1)["truncated"])
+
+    wall = cube("protected_boolean_wall", (12, 0, 0), (4, 1, 3))
+    cutter = cube("allowed_boolean_cutter", (12, 0, 0), (1, 2, 1))
+    boolean = wall.modifiers.new("opening", "BOOLEAN")
+    boolean.operation = "DIFFERENCE"; boolean.object = cutter
+    bpy.context.view_layer.update()
+    wall_before = qa.snapshot([wall.name])
+    mesh_count = len(bpy.data.meshes)
+    cutter.location.x += .5
+    bpy.context.view_layer.update()
+    wall_compare = qa.compare_snapshot(wall_before)
+    verify("boolean_dependency_change_detected", not wall_compare["ok"] and
+           "evaluated_geometry" in wall_compare["changed"][0]["components"])
+    cutter.location.x -= .5
+    bpy.context.view_layer.update()
+    verify("boolean_dependency_restored", qa.compare_snapshot(wall_before)["ok"])
+    verify("evaluated_snapshot_does_not_leak_meshes", len(bpy.data.meshes) == mesh_count)
+    # ID references are not recursively traversed, so cyclic modifier graphs
+    # cannot recurse indefinitely inside the snapshot serializer.
+    cycle_a = cube("cycle_dependency_a", (15, 0, 0))
+    cycle_b = cube("cycle_dependency_b", (17, 0, 0))
+    for a, b in ((cycle_a, cycle_b), (cycle_b, cycle_a)):
+        modifier = a.modifiers.new("cycle_reference", "BOOLEAN")
+        modifier.object = b
+        modifier.show_viewport = False
+    verify("cyclic_id_references_snapshot_stable", qa.compare_snapshot(qa.snapshot([cycle_a.name, cycle_b.name]))["ok"])
 
     door = cube("door", (4, 4, 1), (1, .04, 2))
     handle = cube("attached_handle", (4.25, 4.12, 1), (.1, .2, .1))
@@ -116,6 +180,17 @@ def run(output_directory):
     verify("attached_motion_passes", qa.check_motion(door, [handle])["ok"])
     verify("unparented_motion_detected", not qa.check_motion(door, [floating])["ok"])
     verify("motion_restores_transform", max(abs(old[i][j]-door.matrix_basis[i][j]) for i in range(4) for j in range(4)) < 1e-7)
+    fixed = bpy.data.objects.new("fixed_rotation", None)
+    s.collection.objects.link(fixed)
+    constraint = door.constraints.new("COPY_ROTATION")
+    constraint.target = fixed
+    bpy.context.view_layer.update()
+    blocked = qa.check_motion(door, [floating])
+    verify("constrained_root_reports_blocked", not blocked["ok"] and blocked["status"] == "blocked")
+    verify("blocked_motion_restores_transform", max(abs(old[i][j]-door.matrix_basis[i][j]) for i in range(4) for j in range(4)) < 1e-7)
+    door.constraints.remove(constraint)
+    bpy.context.view_layer.update()
+    verify("zero_rotation_is_not_a_pass", qa.check_motion(door, [floating], angle_degrees=0)["status"] == "blocked")
     before_gap = qa.check_contact(floating, door)["gap_m"]
     s.unit_settings.scale_length = .01
     verify("distances_respect_scene_units", abs(qa.check_contact(floating, door)["gap_m"] - before_gap * .01) < 1e-7)

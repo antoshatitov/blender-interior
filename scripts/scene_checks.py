@@ -14,7 +14,7 @@ from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 GEOMETRY_TYPES = {"MESH", "CURVE", "SURFACE", "FONT"}
 
 
@@ -53,7 +53,9 @@ def _rna(value, skip=(), depth=0):
     skip = set(skip) | {"rna_type", "id_data"}
     for prop in value.bl_rna.properties:
         key = prop.identifier
-        if key in skip or prop.is_hidden:
+        # Add-on RNA getters (e.g. Cycles settings) can lazily create ID
+        # properties. Existing stored settings are captured by _custom instead.
+        if key in skip or prop.is_hidden or getattr(prop, "is_runtime", False):
             continue
         try:
             out[key] = _atom(getattr(value, key), depth + 1)
@@ -84,7 +86,9 @@ def _tree(tree, seen=None):
                "props": _rna(node, skip={"inputs", "outputs", "internal_links", "dimensions",
                                           "location", "width", "height", "parent", "select"}),
                "inputs": [{"identifier": s.identifier, "default": _atom(s.default_value)}
-                          for s in node.inputs if hasattr(s, "default_value")]}
+                          for s in node.inputs if hasattr(s, "default_value")],
+               "outputs": [{"identifier": s.identifier, "default": _atom(s.default_value)}
+                           for s in node.outputs if hasattr(s, "default_value")]}
         if hasattr(node, "node_tree") and node.node_tree:
             row["group"] = _tree(node.node_tree, seen)
         if hasattr(node, "color_ramp"):
@@ -164,6 +168,8 @@ def _collection_paths(scene):
 def snapshot(names=None):
     """Hash source datablocks, shader graphs and protected object state without mutation."""
     scene = bpy.context.scene
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
     selected = list(scene.objects) if names is None else [scene.objects[n] for n in names]
     paths, layers = _collection_paths(scene)
     data_cache, material_cache, objects = {}, {}, {}
@@ -186,6 +192,7 @@ def snapshot(names=None):
                  "matrix_basis": _atom(obj.matrix_basis), "parent": _atom(obj.parent),
                  "parent_type": obj.parent_type, "parent_bone": obj.parent_bone,
                  "parent_inverse": _atom(obj.matrix_parent_inverse), "data": data_hash,
+                 "evaluated_geometry": _evaluated_geometry_hash(obj, depsgraph),
                  "materials": materials, "custom": _custom(obj),
                  "visibility": {k: getattr(obj, k) for k in
                                 ("hide_viewport", "hide_render", "hide_select", "display_type")},
@@ -204,7 +211,7 @@ def snapshot(names=None):
 
 def compare_snapshot(before):
     if before.get("format_version") != FORMAT_VERSION:
-        raise ValueError("Unsupported snapshot format")
+        raise ValueError("Unsupported snapshot format; capture a fresh baseline with this helper version")
     names = before["objects"]
     existing = [n for n in names if n in bpy.context.scene.objects]
     now = snapshot(existing)
@@ -246,6 +253,23 @@ def _geometry(value):
     finally:
         ev.to_mesh_clear()
     return obj, vertices, faces, triangles
+
+
+def _evaluated_geometry_hash(obj, depsgraph):
+    """Observe dependency effects without recursively walking Blender ID graphs."""
+    if obj.type not in GEOMETRY_TYPES:
+        return None
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    if mesh is None:
+        raise ValueError(f"Cannot evaluate protected geometry: {obj.name}")
+    try:
+        return _hash({"vertices": [tuple(v.co) for v in mesh.vertices],
+                      "edges": [tuple(e.vertices) for e in mesh.edges],
+                      "faces": [(tuple(p.vertices), p.material_index, p.use_smooth)
+                                for p in mesh.polygons]})
+    finally:
+        evaluated.to_mesh_clear()
 
 
 def _bounds(obj):
@@ -413,7 +437,7 @@ def inspect_pair(a, b, epsilon_m=1e-6, max_triangle_pairs=10000):
                 candidate_pairs.add((i, j))
         if truncated:
             break
-    coplanar, crossing, touching, area = 0, 0, 0, 0.0
+    coplanar, crossing, ambiguous, area = 0, 0, 0, 0.0
     for i, j in sorted(candidate_pairs):
         first, second = [va[k] for k in ta[i]], [vb[k] for k in tb[j]]
         na = (first[1] - first[0]).cross(first[2] - first[0])
@@ -431,10 +455,12 @@ def inspect_pair(a, b, epsilon_m=1e-6, max_triangle_pairs=10000):
         elif (i, j) in hits and min(da) < -epsilon and max(da) > epsilon and min(db) < -epsilon and max(db) > epsilon:
             crossing += 1
         elif (i, j) in hits:
-            touching += 1
+            # A seam can hide a crossing from the strict triangle-plane test.
+            # These hits are unresolved contacts, never proof of safe touching.
+            ambiguous += 1
     return {"a": _object(a).name, "b": _object(b).name,
             "coplanar_overlap_triangle_pairs": coplanar, "coplanar_overlap_area_m2": area,
-            "crossing_surface_candidates": crossing, "touching_triangle_pairs": touching,
+            "crossing_surface_candidates": crossing, "ambiguous_contact_triangle_pairs": ambiguous,
             "truncated": truncated,
             "containment_checked": False, "interpretation": "needs_assembly_and_visual_confirmation"}
 
@@ -471,12 +497,17 @@ def check_motion(root, members, axis="Z", angle_degrees=45, tolerance=1e-5):
     members = [_object(n) for n in members]
     if root in members or not members:
         raise ValueError("List the expected moving members, excluding the root")
+    if tolerance <= 0 or not math.isfinite(angle_degrees):
+        raise ValueError("Positive tolerance and finite angle required")
+    bpy.context.view_layer.update()
     old = root.matrix_basis.copy()
+    old_world = root.matrix_world.copy()
     relative = {o.name: root.matrix_world.inverted() @ o.matrix_world for o in members}
     errors = []
     try:
         root.matrix_basis = old @ Matrix.Rotation(math.radians(angle_degrees), 4, axis)
         bpy.context.view_layer.update()
+        actual_angle = old_world.to_quaternion().rotation_difference(root.matrix_world.to_quaternion()).angle
         for obj in members:
             expected = root.matrix_world @ relative[obj.name]
             error = max(abs(expected[i][j] - obj.matrix_world[i][j]) for i in range(4) for j in range(4))
@@ -484,7 +515,11 @@ def check_motion(root, members, axis="Z", angle_degrees=45, tolerance=1e-5):
     finally:
         root.matrix_basis = old
         bpy.context.view_layer.update()
-    return {"root": root.name, "members": errors, "ok": all(e["transform_error"] <= tolerance for e in errors),
+    status = "blocked" if actual_angle <= tolerance else \
+        "passed" if all(e["transform_error"] <= tolerance for e in errors) else "failed"
+    return {"root": root.name, "members": errors, "ok": status == "passed", "status": status,
+            "actual_rotation_radians": actual_angle,
+            "reason": "no_effective_root_rotation" if status == "blocked" else None,
             "collision_sweep_checked": False}
 
 

@@ -40,6 +40,31 @@ class ReferenceIndexTests(unittest.TestCase):
 
 
 class InstallTests(unittest.TestCase):
+    def test_reject_payload_root_symlinks_before_copying(self):
+        for entry in installer.PAYLOAD:
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "repo"
+                source.mkdir()
+                (source / "SKILL.md").write_text("skill")
+                outside = root / "external"
+                outside.mkdir()
+                (outside / "private.txt").write_text("must not be copied")
+                link = source / entry
+                if link.exists():
+                    link.unlink()
+                link.symlink_to(outside, target_is_directory=True)
+                target = root / "codex/skills/blender-interior"
+                target.mkdir(parents=True)
+                (target / "SKILL.md").write_text("existing installation")
+                with self.assertRaises(ValueError):
+                    installer.payload_files(source)
+                with self.assertRaises(ValueError):
+                    installer.install(source, target)
+                self.assertEqual((target / "SKILL.md").read_text(), "existing installation")
+                self.assertFalse((target / entry / "private.txt").exists())
+                self.assertFalse((root / "codex/skill-backups").exists())
+
     def test_install_update_backup_and_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

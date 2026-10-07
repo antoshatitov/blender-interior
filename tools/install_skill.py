@@ -19,6 +19,8 @@ def payload_files(source):
     files = []
     for name in PAYLOAD:
         entry = source / name
+        if entry.is_symlink():
+            raise ValueError(f"Symlinks are not supported in the payload: {name}")
         candidates = [entry] if entry.is_file() else entry.rglob("*") if entry.is_dir() else []
         for path in candidates:
             relative = path.relative_to(source)

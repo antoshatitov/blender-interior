@@ -22,3 +22,20 @@ jobs:
         run: python -m compileall -q scripts tools tests
       - name: Test indexer and installer
         run: python -m unittest discover -s tests -v
+
+  blender-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download official Blender 4.3.2
+        run: |
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/blender.tar.xz" https://download.blender.org/release/Blender4.3/blender-4.3.2-linux-x64.tar.xz
+          sha256sum --check <<< "4da1c956673c0485e63054e563ee69198cc8f80d8157dd7592dffc8a6a5592e6  $RUNNER_TEMP/blender.tar.xz"
+          tar -xJf "$RUNNER_TEMP/blender.tar.xz" -C "$RUNNER_TEMP"
+      - name: Run Blender regression fixtures
+        run: '"$RUNNER_TEMP/blender-4.3.2-linux-x64/blender" --background --factory-startup --python-exit-code 1 --python tests/run_blender_tests.py -- --output "$RUNNER_TEMP/blender-results"'
+      - name: Verify saved fixtures in a new process
+        run: '"$RUNNER_TEMP/blender-4.3.2-linux-x64/blender" --background "$RUNNER_TEMP/blender-results/fixtures.blend" --python-exit-code 1 --python tests/run_blender_tests.py -- --output "$RUNNER_TEMP/blender-results" --reopen'
